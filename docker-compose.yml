@@ -1,0 +1,37 @@
+services:
+  coordinator:
+    build: .
+    command: uvicorn coordinator.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      SCAN_DB_PATH: /data/coordinator.db
+      SCAN_SCHEDULER_INTERVAL: "15"
+    volumes:
+      - scan-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  agent-1:
+    build: .
+    command: python -m agent.worker --coordinator http://coordinator:8000 --agent-id demo-agent-1
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    environment:
+      SCAN_ADAPTER_FAIL_RATE: "0.0"
+
+  agent-2:
+    build: .
+    command: python -m agent.worker --coordinator http://coordinator:8000 --agent-id demo-agent-2
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    environment:
+      SCAN_ADAPTER_FAIL_RATE: "0.2"
+
+volumes:
+  scan-data:
