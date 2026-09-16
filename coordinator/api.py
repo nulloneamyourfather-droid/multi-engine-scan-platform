@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from adapters import create_adapter, list_adapters
 from coordinator.scheduler import Scheduler
 from coordinator.task_manager import TaskManager
-from models.task import ScanResult, ScanTask, ScanVerdict, TaskStatus
+from models.task import ScanResult, ScanVerdict, TaskStatus
 from storage.sqlite import SQLiteStore
 
 logger = logging.getLogger(__name__)
@@ -35,15 +35,17 @@ class ClaimRequest(BaseModel):
 
 
 class SubmitRequest(BaseModel):
-    artifact_sha256: str = Field(min_length=6, max_length=128)
+    artifact_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
     engines: list[str] = Field(min_length=1)
     priority: int = 0
     max_retries: int = 3
+    execution_timeout_s: float = 300.0
 
 
 class AgentRegister(BaseModel):
     agent_id: str
     hostname: str = ""
+    capabilities: list[str] = Field(default_factory=list)
 
 
 class StartRequest(BaseModel):
@@ -53,7 +55,7 @@ class StartRequest(BaseModel):
 class ResultRequest(BaseModel):
     agent_id: str
     verdict: ScanVerdict
-    error: Optional[str] = None
+    error: str | None = None
     details: dict[str, Any] = Field(default_factory=dict)
     scan_duration_ms: int = 0
 
@@ -89,11 +91,17 @@ def build_app(store: SQLiteStore, scheduler_interval: float = 15.0) -> FastAPI:
         unknown = [e for e in req.engines if e not in list_adapters()]
         if unknown:
             raise HTTPException(400, f"unknown engines: {unknown}")
-        tasks = tm.submit(req.artifact_sha256, req.engines, req.priority, req.max_retries)
+        tasks = tm.submit(
+            req.artifact_sha256,
+            req.engines,
+            req.priority,
+            req.max_retries,
+            req.execution_timeout_s,
+        )
         return {"submitted": [t.to_dict() for t in tasks]}
 
     @app.get("/tasks")
-    def list_tasks(status: Optional[str] = None) -> list[dict[str, Any]]:
+    def list_tasks(status: str | None = None) -> list[dict[str, Any]]:
         st = TaskStatus(status) if status else None
         return [t.to_dict() for t in tm.store.list_tasks(status=st)]
 
@@ -111,6 +119,13 @@ def build_app(store: SQLiteStore, scheduler_interval: float = 15.0) -> FastAPI:
             raise HTTPException(404, "no result yet")
         return result.to_dict()
 
+    @app.get("/tasks/{task_id}/attempts")
+    def get_attempts(task_id: str) -> list[dict[str, Any]]:
+        task = tm.store.get_task(task_id)
+        if task is None:
+            raise HTTPException(404, "task not found")
+        return [a.to_dict() for a in tm.store.list_attempts(task_id)]
+
     @app.post("/tasks/{task_id}/start")
     def start_task(task_id: str, req: StartRequest) -> dict[str, Any]:
         task = tm.start(task_id, req.agent_id)
@@ -120,7 +135,9 @@ def build_app(store: SQLiteStore, scheduler_interval: float = 15.0) -> FastAPI:
 
     @app.post("/tasks/claim", status_code=200)
     def claim_task(req: ClaimRequest) -> dict[str, Any]:
-        task = tm.claim(req.agent_id)
+        agent = store.get_agent(req.agent_id)
+        capabilities = agent["capabilities"] if agent else []
+        task = tm.claim(req.agent_id, capabilities)
         if task is None:
             raise HTTPException(404, "no task available")
         return task.to_dict()
@@ -150,7 +167,7 @@ def build_app(store: SQLiteStore, scheduler_interval: float = 15.0) -> FastAPI:
 
     @app.post("/agents/register")
     def register(req: AgentRegister) -> dict[str, str]:
-        store.register_agent(req.agent_id, req.hostname)
+        store.register_agent(req.agent_id, req.hostname, req.capabilities)
         return {"status": "registered"}
 
     @app.post("/agents/heartbeat")

@@ -30,7 +30,7 @@ class Executor:
             if result.verdict is None:
                 result.verdict = ScanVerdict.UNKNOWN
             return result
-        except Exception as exc:  # infrastructure failure -> retryable
+        except Exception as exc:  # noqa: BLE001 - any adapter failure is a retryable infra error
             logger.warning("engine %s failed on %s: %s", task.engine, task.task_id, exc)
             return ScanResult(
                 task_id=task.task_id,

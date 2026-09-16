@@ -1,8 +1,6 @@
 """End-to-end API tests: submit -> claim -> start -> report -> result."""
 from __future__ import annotations
 
-import time
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -57,8 +55,14 @@ def test_submit_unknown_engine_rejected(client):
 
 
 def test_full_agent_flow(client):
-    # agent registers
-    assert client.post("/agents/register", json={"agent_id": "agent-1", "hostname": "h1"}).status_code == 200
+    # agent registers with capabilities it can run
+    assert (
+        client.post(
+            "/agents/register",
+            json={"agent_id": "agent-1", "hostname": "h1", "capabilities": ["mock_engine_a"]},
+        ).status_code
+        == 200
+    )
 
     # submit one task
     (task,) = client.post(

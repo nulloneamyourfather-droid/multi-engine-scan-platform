@@ -17,7 +17,7 @@ services:
 
   agent-1:
     build: .
-    command: python -m agent.worker --coordinator http://coordinator:8000 --agent-id demo-agent-1
+    command: python -m agent.worker --coordinator http://coordinator:8000 --agent-id demo-agent-1 --capabilities mock_engine_a
     depends_on:
       coordinator:
         condition: service_healthy
@@ -26,7 +26,7 @@ services:
 
   agent-2:
     build: .
-    command: python -m agent.worker --coordinator http://coordinator:8000 --agent-id demo-agent-2
+    command: python -m agent.worker --coordinator http://coordinator:8000 --agent-id demo-agent-2 --capabilities mock_engine_b
     depends_on:
       coordinator:
         condition: service_healthy

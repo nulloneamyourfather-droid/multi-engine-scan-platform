@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 
 class TaskStatus(str, Enum):
@@ -28,7 +28,12 @@ class ScanVerdict(str, Enum):
 
 @dataclass
 class ScanTask:
-    """A unit of work: scan one artifact with one engine."""
+    """A unit of work: scan one artifact with one engine.
+
+    ``task`` is the business lifecycle of a scan request; each actual execution
+    is a separate ``ScanAttempt`` (see models/attempt.py). A task that keeps
+    failing is retried up to ``max_retries`` attempts, then stays FAILED.
+    """
 
     artifact_sha256: str
     engine: str
@@ -37,7 +42,8 @@ class ScanTask:
     priority: int = 0
     max_retries: int = 3
     attempts: int = 0
-    agent_id: Optional[str] = None
+    agent_id: str | None = None
+    execution_timeout_s: float = 300.0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -51,6 +57,7 @@ class ScanTask:
             "max_retries": self.max_retries,
             "attempts": self.attempts,
             "agent_id": self.agent_id,
+            "execution_timeout_s": self.execution_timeout_s,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -67,7 +74,7 @@ class ScanResult:
     verdict: ScanVerdict
     submitted_at: float
     scan_duration_ms: int
-    error: Optional[str] = None
+    error: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

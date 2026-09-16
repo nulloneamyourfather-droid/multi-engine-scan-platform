@@ -11,6 +11,8 @@ Retry & Fault Tolerance · State Machine · REST API · Result Normalization ·
 Automated Testing
 ```
 
+[![CI](https://github.com/nulloneamyourfather-droid/multi-engine-scan-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/nulloneamyourfather-droid/multi-engine-scan-platform/actions/workflows/ci.yml)
+
 ## Problem
 
 Running malware scans at scale with multiple engines (signature, heuristic,
@@ -36,16 +38,27 @@ Agents × N  ──►  Executor  ──►  ScannerAdapter (mock_engine_a / b /
 ```
 
 - **Coordinator** — REST API, task queue, state machine, retry budget, and a
-  scheduler that reclaims tasks from dead agents.
-- **Agent** — pull-based worker: registers, heartbeats, claims tasks, runs them
-  through an adapter, reports normalized results. Join any number of agents to a
-  running coordinator with zero coordinator-side config.
+  scheduler that reclaims tasks from dead agents. **Capability-aware
+  scheduling**: agents advertise which engines they can run, so tasks only go
+  to nodes that actually have the engine.
+- **Agent** — pull-based worker: registers with its capabilities, heartbeats,
+  claims tasks, runs them through an adapter, reports normalized results.
+  A **lease** model guarantees one worker executes a task: a `409` on start
+  means the lease expired and the agent must not run. Join any number of
+  heterogeneous agents to a running coordinator with zero coordinator-side
+  config.
 - **Adapter** — one interface (`scan(task) -> ScanResult`); the mock engines
   demonstrate the contract and the retry path. Real engines plug in the same
   way.
 
+**Reliability**: results are reported with exponential backoff and the result
+endpoint is **idempotent**, so a network blip can't strand a finished task in
+`running`. Every execution is recorded as a **ScanAttempt** (task vs attempt
+separation), keeping full retry history; a reclaim by the scheduler consumes
+one retry budget, so a crashing agent can't loop forever.
+
 See [docs/architecture.md](docs/architecture.md) for the full design (lifecycle
-diagram, failure-handling table, trade-offs).
+diagram, lease/execution-timeout model, failure-handling table, trade-offs).
 
 ## Core design
 
@@ -75,8 +88,25 @@ queued → assigned → running → succeeded | failed → (retry) → queued
 - engine crash → adapter raises → agent reports `failed` → coordinator requeues
   until `max_retries`;
 - agent dies → heartbeat goes silent → scheduler reclaims its tasks;
+- agent hangs → task `RUNNING` past `execution_timeout_s` → lease expires →
+  scheduler reclaims;
+- result lost → agent retries with backoff; idempotent endpoint dedupes;
+- stale worker double-executes → lease revoked, `start` returns `409`, late
+  report rejected;
 - coordinator restarts → tasks persist in SQLite, state machine resumes;
 - claim race → `BEGIN IMMEDIATE` transaction guarantees one agent per task.
+
+**Capability-aware scheduling**
+
+Agents register the engines they can actually run:
+
+```json
+{ "agent_id": "agent-win-01", "capabilities": ["mock_engine_a"] }
+{ "agent_id": "agent-linux-01", "capabilities": ["mock_engine_b"] }
+```
+
+Claiming filters by capability — an engine-B-only agent never claims an
+engine-A task.
 
 ## Quick start
 
@@ -94,10 +124,11 @@ python -m uvicorn coordinator.main:app --host 0.0.0.0 --port 8000
 
 Interactive API docs: http://127.0.0.1:8000/docs
 
-**2. Start one or more agents**
+**2. Start one or more agents** (agents advertise the engines they can run)
 
 ```bash
-python -m agent.worker --coordinator http://127.0.0.1:8000 --agent-id agent-1
+python -m agent.worker --coordinator http://127.0.0.1:8000 --agent-id agent-1 \
+  --capabilities mock_engine_a mock_engine_b
 ```
 
 **3. Submit a scan task**
@@ -119,8 +150,11 @@ curl http://127.0.0.1:8000/tasks/<task_id>/result
 ### Docker
 
 ```bash
-docker compose up --build     # coordinator + 2 agents
+docker compose up --build     # coordinator + 2 agents (mock_engine_a and mock_engine_b)
 ```
+
+The compose file wires two agents with different `--capabilities`, so you can
+see capability-aware scheduling in action.
 
 ### Tests
 
@@ -157,12 +191,20 @@ Normalized result for `mock_engine_a`:
 ## Test results
 
 ```
-29 passed, 1 warning in 0.49s
+39 passed
 ```
 
-Coverage: state machine transitions (valid + invalid), task manager
-submit/claim/report/retry/heartbeat-reclaim, adapter verdicts & failure path,
-end-to-end API flow (submit → claim → start → report → result).
+CI runs on Python 3.10 / 3.11 / 3.12 with ruff linting. Coverage includes:
+
+- state machine transitions (valid + invalid)
+- task manager submit/claim/report/retry/heartbeat-reclaim
+- **20-thread concurrent claim — exactly one agent wins**
+- **capability-aware scheduling — engine-B-only agent never gets engine-A task**
+- **lease expiry — reclaimed task rejects stale agent's start and late report**
+- **idempotent result reporting — duplicate reports don't corrupt state**
+- **execution timeout — hung task reclaimed, retry budget consumed**
+- **attempt history — every execution recorded with verdict & error**
+- end-to-end API flow (submit → claim → start → report → result)
 
 ## Roadmap
 

@@ -43,19 +43,29 @@ with an adapter become a worker.
 ```
 
 ### Coordinator
-- **REST API** (`coordinator/api.py`): task submission, task/result queries,
-  agent registration & heartbeat, engine metadata.
+- **REST API** (`coordinator/api.py`): task submission, task/result/attempt
+  queries, agent registration (with capabilities) & heartbeat, engine metadata.
 - **TaskManager** (`coordinator/task_manager.py`): the single authority on task
-  lifecycle — claiming, start ack, result finalization, retry budgeting.
+  lifecycle — capability-aware claiming, lease start ack, idempotent result
+  finalization, retry budgeting, stale reclaim.
 - **StateMachine** (`models/state_machine.py`): a whitelist of legal transitions;
-  anything else raises `InvalidTransition`. See the lifecycle below.
+  anything else raises `InvalidTransition`. Every state change passes through it;
+  Storage never mutates status directly.
 - **Scheduler** (`coordinator/scheduler.py`): an asyncio loop that reclaims
-  tasks whose agent heartbeat has expired — the fault-tolerance path for a
-  crashed or wedged agent.
+  stale tasks (heartbeat lost **or** execution lease timed out) — the
+  fault-tolerance path for a crashed or wedged agent.
 
 ### Agent
-- Pull-based worker (`agent/worker.py`): registers once, then loops
-  `claim → start → execute → report`, heartbeating in a background thread.
+- Pull-based worker (`agent/worker.py`): registers once (advertising its
+  `capabilities`), then loops `claim → start → execute → report`, heartbeating
+  in a background thread.
+- **Lease start ack**: `start` returning `409` means the coordinator has
+  reclaimed the task (lease expired); the agent then **must not execute**, to
+  avoid two workers scanning the same artifact.
+- **Result report retry**: results are reported with exponential backoff, and
+  the coordinator's result endpoint is idempotent — so a transient network blip
+  cannot strand a finished task in `running` (at-least-once + idempotency ⇒
+  logically exactly-once results).
 - **Executor** (`agent/executor.py`): engine-agnostic — looks up the adapter by
   name and turns adapter exceptions into retryable `failed` results.
 
@@ -71,7 +81,8 @@ with an adapter become a worker.
 ### Storage (`storage/sqlite.py`)
 SQLite with a locking wrapper. `claim_next_task` uses `BEGIN IMMEDIATE` so two
 agents can never claim the same task — the correctness point of a distributed
-queue.
+queue. Storage is deliberately dumb: it only persists; it never decides state
+transitions.
 
 ## Task lifecycle
 
@@ -88,8 +99,47 @@ succeeded                    failed
 ```
 
 A failed task with retries remaining returns to `queued` and can be claimed by a
-different agent; after `max_retries` it stays `failed`. A task whose agent stops
-heartbeating is reclaimed by the scheduler and requeued.
+different agent; after `max_retries` it stays `failed`.
+
+### Leases & execution timeout
+
+Claiming gives an agent an exclusive **lease** on a task. The lease expires when:
+
+- the agent's heartbeat goes silent (agent crashed), or
+- the task stays `RUNNING` longer than `execution_timeout_s` (the engine hung).
+
+Either way the scheduler reclaims the task. A reclaim **consumes one retry
+budget**, so a repeatedly-crashing agent cannot reschedule the same task
+forever. A reclaimed task is also un-leased: the old agent's `start` gets a
+`409` and must not run, and its late `report` is rejected.
+
+### Task vs attempt
+
+A task is the **business lifecycle** of a scan request; each actual execution
+on an agent is a **`ScanAttempt`** (task_id + attempt_no + agent_id + status +
+timing + error + verdict). Retries keep their history:
+
+```
+attempt 1: agent-1  timeout       (reclaimed by scheduler)
+attempt 2: agent-2  engine error  (reported failed)
+attempt 3: agent-2  succeeded     (final)
+```
+
+`GET /tasks/{id}/attempts` exposes the full history; the task row stores only
+the aggregate status.
+
+### Heterogeneous nodes & capability-aware scheduling
+
+Agents register the engines they can actually run:
+
+```json
+{ "agent_id": "agent-win-01", "capabilities": ["mock_engine_a"] }
+{ "agent_id": "agent-linux-01", "capabilities": ["mock_engine_b"] }
+```
+
+Claiming filters by capability (`WHERE engine IN (...)`), so an engine-B-only
+agent never gets an engine-A task. This is what makes the platform genuinely
+"heterogeneous" rather than a single-engine demo.
 
 ## Result normalization
 
@@ -118,7 +168,10 @@ per-engine accuracy) can be layered on top without knowing any engine internals.
 | Failure | Detection | Recovery |
 |---|---|---|
 | Engine raises during scan | Executor catches, emits `failed` result | Coordinator requeues if attempts remain |
-| Agent process dies | Heartbeat goes silent | Scheduler reclaims task after timeout |
+| Agent process dies | Heartbeat goes silent | Scheduler reclaims task after timeout; reclaim consumes retry budget |
+| Agent wedged / engine hangs | Task `RUNNING` past `execution_timeout_s` | Scheduler reclaims (lease expiry) |
+| Result report lost (network blip) | Report HTTP error | Agent retries with backoff; endpoint is idempotent |
+| Stale worker double-executes | Task reclaimed, lease revoked | `start` → `409` (must not run); late `report` rejected |
 | Coordinator restart | — | Tasks persist in SQLite; state machine resumes |
 | Two agents race a claim | `BEGIN IMMEDIATE` transaction | Only one gets the task |
 

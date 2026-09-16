@@ -10,7 +10,7 @@ from __future__ import annotations
 import abc
 from typing import Any
 
-from models.task import ScanResult, ScanTask, ScanVerdict
+from models.task import ScanResult, ScanTask
 
 
 class ScannerAdapter(abc.ABC):

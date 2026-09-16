@@ -13,8 +13,7 @@ Any other transition is rejected with ``InvalidTransition``.
 """
 from __future__ import annotations
 
-from enum import Enum
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from models.task import TaskStatus
 
@@ -42,7 +41,7 @@ class TaskStateMachine:
 
     def __init__(
         self,
-        on_transition: Optional[Callable[[TaskStatus, TaskStatus], None]] = None,
+        on_transition: Callable[[TaskStatus, TaskStatus], None] | None = None,
     ) -> None:
         self._on_transition = on_transition
 

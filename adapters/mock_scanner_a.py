@@ -41,5 +41,5 @@ class MockScannerA(ScannerAdapter):
             verdict=verdict,
             submitted_at=time.time(),
             scan_duration_ms=int((time.monotonic() - start) * 1000),
-            details={"matched_rule": "MockSig.{}".format(h[:8])} if malicious else {},
+            details={"matched_rule": f"MockSig.{h[:8]}"} if malicious else {},
         )

@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 
 from coordinator.task_manager import TaskManager
-from models.task import ScanResult, ScanTask, ScanVerdict, TaskStatus
+from models.task import ScanResult, ScanVerdict, TaskStatus
 from storage.sqlite import SQLiteStore
 
 
@@ -22,10 +22,10 @@ def test_submit_creates_one_task_per_engine():
 
 def test_claim_moves_queued_to_assigned_and_binds_agent():
     tm = _make_manager()
-    (task,) = tm.submit("a" * 64, ["mock_engine_a"])
+    (_task,) = tm.submit("a" * 64, ["mock_engine_a"])
     claimed = tm.claim("agent-1")
     assert claimed is not None
-    assert claimed.task_id == task.task_id
+    assert claimed.task_id == _task.task_id
     assert claimed.status == TaskStatus.ASSIGNED
     assert claimed.agent_id == "agent-1"
     # Second claim must not get the same task.
@@ -34,7 +34,7 @@ def test_claim_moves_queued_to_assigned_and_binds_agent():
 
 def test_report_success_finalizes_task_and_saves_result():
     tm = _make_manager()
-    (task,) = tm.submit("a" * 64, ["mock_engine_a"])
+    (_task,) = tm.submit("a" * 64, ["mock_engine_a"])
     claimed = tm.claim("agent-1")
     assert claimed is not None
     tm.start(claimed.task_id, "agent-1")
@@ -92,7 +92,7 @@ def test_heartbeat_keeps_agent_online_and_stale_task_is_requeued():
     tm.store.register_agent("agent-1", "host1")
     tm.heartbeat("agent-1")
 
-    (task,) = tm.submit("a" * 64, ["mock_engine_a"])
+    (_task,) = tm.submit("a" * 64, ["mock_engine_a"])
     claimed = tm.claim("agent-1")
     assert claimed is not None
     tm.start(claimed.task_id, "agent-1")
@@ -100,7 +100,7 @@ def test_heartbeat_keeps_agent_online_and_stale_task_is_requeued():
     # No heartbeat for longer than timeout -> scheduler should requeue.
     n = tm.requeue_stale(now=time.time() + tm.heartbeat_timeout + 10)
     assert n == 1
-    requeued = tm.store.get_task(task.task_id)
+    requeued = tm.store.get_task(_task.task_id)
     assert requeued.status == TaskStatus.QUEUED
     assert requeued.agent_id is None
 
