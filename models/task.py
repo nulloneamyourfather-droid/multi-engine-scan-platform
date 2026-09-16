@@ -42,6 +42,7 @@ class ScanTask:
     priority: int = 0
     max_retries: int = 3
     attempts: int = 0
+    reclaim_count: int = 0
     agent_id: str | None = None
     execution_timeout_s: float = 300.0
     created_at: float = field(default_factory=time.time)
@@ -56,6 +57,7 @@ class ScanTask:
             "priority": self.priority,
             "max_retries": self.max_retries,
             "attempts": self.attempts,
+            "reclaim_count": self.reclaim_count,
             "agent_id": self.agent_id,
             "execution_timeout_s": self.execution_timeout_s,
             "created_at": self.created_at,

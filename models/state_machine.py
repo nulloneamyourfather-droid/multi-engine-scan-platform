@@ -27,7 +27,7 @@ class InvalidTransition(Exception):
 
 _TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.QUEUED: frozenset({TaskStatus.ASSIGNED}),
-    TaskStatus.ASSIGNED: frozenset({TaskStatus.RUNNING, TaskStatus.QUEUED}),
+    TaskStatus.ASSIGNED: frozenset({TaskStatus.RUNNING, TaskStatus.QUEUED, TaskStatus.FAILED}),
     TaskStatus.RUNNING: frozenset(
         {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.QUEUED}
     ),

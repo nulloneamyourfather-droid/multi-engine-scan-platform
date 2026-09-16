@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     priority            INTEGER NOT NULL DEFAULT 0,
     max_retries         INTEGER NOT NULL DEFAULT 3,
     attempts            INTEGER NOT NULL DEFAULT 0,
+    reclaim_count       INTEGER NOT NULL DEFAULT 0,
     agent_id            TEXT,
     execution_timeout_s REAL NOT NULL DEFAULT 300,
     created_at          REAL NOT NULL,
@@ -88,7 +89,7 @@ class SQLiteStore:
     def insert_task(self, task: ScanTask) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     task.task_id,
                     task.artifact_sha256,
@@ -97,6 +98,7 @@ class SQLiteStore:
                     task.priority,
                     task.max_retries,
                     task.attempts,
+                    task.reclaim_count,
                     task.agent_id,
                     task.execution_timeout_s,
                     task.created_at,
@@ -344,6 +346,7 @@ class SQLiteStore:
             priority=row["priority"],
             max_retries=row["max_retries"],
             attempts=row["attempts"],
+            reclaim_count=row["reclaim_count"],
             agent_id=row["agent_id"],
             execution_timeout_s=row["execution_timeout_s"],
             created_at=row["created_at"],

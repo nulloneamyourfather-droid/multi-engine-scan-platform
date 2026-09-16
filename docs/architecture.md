@@ -62,10 +62,15 @@ with an adapter become a worker.
 - **Lease start ack**: `start` returning `409` means the coordinator has
   reclaimed the task (lease expired); the agent then **must not execute**, to
   avoid two workers scanning the same artifact.
-- **Result report retry**: results are reported with exponential backoff, and
-  the coordinator's result endpoint is idempotent — so a transient network blip
-  cannot strand a finished task in `running` (at-least-once + idempotency ⇒
-  logically exactly-once results).
+- **Result report retry**: results are reported with exponential backoff
+  (network errors / 5xx / 429 only; a 4xx like 409 means the lease is gone and
+  retrying is pointless), and the coordinator's result endpoint is idempotent —
+  so a transient network blip cannot strand a finished task in `running`.
+- **Execution semantics**: execution is **at-least-once** (a network partition
+  can leave two agents running a reclaimed task); the platform guarantees a
+  single *accepted* outcome via **lease fencing** (stale starts/reports are
+  rejected) and **idempotent result acceptance** (first accepted terminal
+  result is canonical, later duplicates never overwrite it).
 - **Executor** (`agent/executor.py`): engine-agnostic — looks up the adapter by
   name and turns adapter exceptions into retryable `failed` results.
 
@@ -108,10 +113,19 @@ Claiming gives an agent an exclusive **lease** on a task. The lease expires when
 - the agent's heartbeat goes silent (agent crashed), or
 - the task stays `RUNNING` longer than `execution_timeout_s` (the engine hung).
 
-Either way the scheduler reclaims the task. A reclaim **consumes one retry
-budget**, so a repeatedly-crashing agent cannot reschedule the same task
-forever. A reclaimed task is also un-leased: the old agent's `start` gets a
-`409` and must not run, and its late `report` is rejected.
+Either way the scheduler reclaims the task, and the old agent is un-leased: its
+`start` gets a `409` and must not run, and its late `report` is rejected.
+
+**Attempt semantics** — `task.attempts` counts executions that *actually
+started*; it increments only on ASSIGNED → RUNNING (`start`). Reclaiming a
+task does **not** increment it:
+
+- RUNNING task goes stale → the in-flight attempt is closed as failed (no new
+  count); the task requeues while `attempts < max_retries`, else FAILED.
+- ASSIGNED task goes stale (agent died before `start`) → nothing executed, so
+  no ScanAttempt is created and `attempts` is untouched. Repeated
+  claim-without-start is bounded by a separate `reclaim_count` (default 5), so
+  a broken node cannot keep grabbing and dropping the same task forever.
 
 ### Task vs attempt
 
@@ -168,7 +182,7 @@ per-engine accuracy) can be layered on top without knowing any engine internals.
 | Failure | Detection | Recovery |
 |---|---|---|
 | Engine raises during scan | Executor catches, emits `failed` result | Coordinator requeues if attempts remain |
-| Agent process dies | Heartbeat goes silent | Scheduler reclaims task after timeout; reclaim consumes retry budget |
+| Agent process dies | Heartbeat goes silent | Scheduler reclaims task after timeout; in-flight attempt closed as failed, retries remain if `attempts < max_retries` |
 | Agent wedged / engine hangs | Task `RUNNING` past `execution_timeout_s` | Scheduler reclaims (lease expiry) |
 | Result report lost (network blip) | Report HTTP error | Agent retries with backoff; endpoint is idempotent |
 | Stale worker double-executes | Task reclaimed, lease revoked | `start` → `409` (must not run); late `report` rejected |

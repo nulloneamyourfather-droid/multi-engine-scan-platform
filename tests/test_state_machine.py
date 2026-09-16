@@ -44,7 +44,8 @@ def test_succeeded_is_terminal(task):
     [
         (TaskStatus.QUEUED, TaskStatus.RUNNING),  # cannot skip assigned
         (TaskStatus.QUEUED, TaskStatus.SUCCEEDED),
-        (TaskStatus.ASSIGNED, TaskStatus.FAILED),  # must go through running
+        # ASSIGNED -> FAILED is legal: it's the "claimed but never started,
+        # budget exhausted" terminal path (see TaskManager.requeue_stale).
         (TaskStatus.FAILED, TaskStatus.RUNNING),   # failed goes back to queued
         (TaskStatus.RUNNING, TaskStatus.ASSIGNED),
     ],
@@ -55,3 +56,12 @@ def test_invalid_transitions_are_rejected(current, target):
     task.status = current
     with pytest.raises(InvalidTransition):
         sm.transition(task, target)
+
+
+def test_assigned_can_fail_permanently():
+    """Budget exhausted while ASSIGNED (agent died before start) -> FAILED."""
+    sm = TaskStateMachine()
+    task = ScanTask(artifact_sha256="a" * 64, engine="e")
+    task.status = TaskStatus.ASSIGNED
+    sm.transition(task, TaskStatus.FAILED)
+    assert task.status == TaskStatus.FAILED

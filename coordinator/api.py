@@ -38,8 +38,8 @@ class SubmitRequest(BaseModel):
     artifact_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
     engines: list[str] = Field(min_length=1)
     priority: int = 0
-    max_retries: int = 3
-    execution_timeout_s: float = 300.0
+    max_retries: int = Field(default=3, ge=1)
+    execution_timeout_s: float = Field(default=300.0, gt=0)
 
 
 class AgentRegister(BaseModel):

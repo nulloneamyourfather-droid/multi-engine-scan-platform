@@ -143,27 +143,69 @@ def test_duplicate_report_is_idempotent():
     assert claimed is not None
     tm.start(claimed.task_id, "agent-1")
 
-    def result():
+    def result(verdict: ScanVerdict):
         return ScanResult(
             task_id=claimed.task_id,
             artifact_sha256="a" * 64,
             engine="mock_engine_a",
             status=TaskStatus.SUCCEEDED,
-            verdict=ScanVerdict.BENIGN,
+            verdict=verdict,
             submitted_at=time.time(),
             scan_duration_ms=5,
         )
 
-    first = tm.report(claimed.task_id, "agent-1", result())
+    first = tm.report(claimed.task_id, "agent-1", result(ScanVerdict.BENIGN))
     assert first is not None and first.status == TaskStatus.SUCCEEDED
-    # duplicate report: same task/agent -> still accepted, no corruption
-    dup = tm.report(claimed.task_id, "agent-1", result())
+    # duplicate report: same task/agent -> ACKed, no corruption
+    dup = tm.report(claimed.task_id, "agent-1", result(ScanVerdict.BENIGN))
     assert dup is not None and dup.status == TaskStatus.SUCCEEDED
     stored = tm.store.get_result(claimed.task_id)
     assert stored is not None and stored.verdict == ScanVerdict.BENIGN
     # exactly one result row, one final status
     assert len(tm.store.list_results()) == 1
     assert tm.store.get_task(claimed.task_id).status == TaskStatus.SUCCEEDED
+
+
+def test_conflicting_duplicate_does_not_overwrite_canonical_result():
+    """True idempotency: the FIRST accepted terminal result is canonical.
+
+    A conflicting duplicate (same task/agent, different verdict) must be
+    ACKed but must NOT overwrite the stored result — otherwise a buggy or
+    stale agent could flip a committed BENIGN into MALICIOUS.
+    """
+    tm = _make_manager()
+    (_task,) = tm.submit("a" * 64, ["mock_engine_a"])
+    claimed = tm.claim("agent-1", ["mock_engine_a"])
+    assert claimed is not None
+    tm.start(claimed.task_id, "agent-1")
+
+    first = ScanResult(
+        task_id=claimed.task_id,
+        artifact_sha256="a" * 64,
+        engine="mock_engine_a",
+        status=TaskStatus.SUCCEEDED,
+        verdict=ScanVerdict.BENIGN,
+        submitted_at=time.time(),
+        scan_duration_ms=5,
+    )
+    assert tm.report(claimed.task_id, "agent-1", first) is not None
+
+    conflicting = ScanResult(
+        task_id=claimed.task_id,
+        artifact_sha256="a" * 64,
+        engine="mock_engine_a",
+        status=TaskStatus.SUCCEEDED,
+        verdict=ScanVerdict.MALICIOUS,  # buggy/stale agent tries to flip it
+        submitted_at=time.time(),
+        scan_duration_ms=6,
+    )
+    ack = tm.report(claimed.task_id, "agent-1", conflicting)
+    assert ack is not None and ack.status == TaskStatus.SUCCEEDED
+
+    stored = tm.store.get_result(claimed.task_id)
+    assert stored is not None
+    assert stored.verdict == ScanVerdict.BENIGN  # canonical result preserved
+    assert stored.scan_duration_ms == 5
 
 
 # ---- lease / execution timeout ----------------------------------------------
@@ -198,6 +240,12 @@ def test_running_task_within_timeout_is_not_reclaimed():
 
 
 def test_repeated_crash_consumes_retry_budget():
+    """Each *started* execution consumes one retry budget; reclaims do not.
+
+    max_retries=2 means two real executions. After two crashes the task is
+    permanently FAILED — a crashing agent cannot loop forever, and a reclaim
+    does not itself count as an extra attempt.
+    """
     tm = _make_manager()
     (task,) = tm.submit("a" * 64, ["mock_engine_a"], max_retries=2)
     for i in range(1, 4):
@@ -209,7 +257,59 @@ def test_repeated_crash_consumes_retry_budget():
         tm.requeue_stale(now=time.time() + tm.heartbeat_timeout + 10)
     final = tm.store.get_task(task.task_id)
     assert final.status == TaskStatus.FAILED  # budget exhausted, no infinite loop
-    assert final.attempts == 2  # max_retries attempts were consumed
+    assert final.attempts == 2  # exactly two executions actually started
+
+
+def test_reclaim_does_not_double_count_attempts():
+    """A task started once and reclaimed once has attempts == 1, not 2."""
+    tm = _make_manager()
+    tm.store.register_agent("agent-1", "h1")
+    (task,) = tm.submit("a" * 64, ["mock_engine_a"], max_retries=3)
+    claimed = tm.claim("agent-1", ["mock_engine_a"])
+    assert claimed is not None
+    tm.start(claimed.task_id, "agent-1")
+    assert tm.store.get_task(task.task_id).attempts == 1
+    tm.heartbeat("agent-1")
+    n = tm.requeue_stale(now=time.time() + tm.heartbeat_timeout + 10)
+    assert n == 1
+    final = tm.store.get_task(task.task_id)
+    assert final.status == TaskStatus.QUEUED
+    assert final.attempts == 1  # NOT incremented by the reclaim
+
+
+def test_assigned_stale_creates_no_attempt_and_fails_after_reclaim_limit():
+    """Agent died before start: no ScanAttempt, attempts untouched, and after
+    max_reclaims_before_start reclaims the task fails permanently (not an
+    infinite loop of claim-without-start)."""
+    tm = _make_manager(heartbeat_timeout=1.0, max_reclaims_before_start=2)
+    tm.store.register_agent("agent-1", "h1")
+    (task,) = tm.submit("a" * 64, ["mock_engine_a"], max_retries=3)
+    # Loop: each round a (possibly new) agent claims, then dies before start,
+    # then the scheduler reclaims the stale ASSIGNED task.
+    for i in range(1, 4):
+        claimed = tm.claim(f"agent-{i}", ["mock_engine_a"])
+        if claimed is None:
+            break
+        tm.requeue_stale(now=time.time() + 10)  # no start() — agent died first
+    final = tm.store.get_task(task.task_id)
+    assert final.status == TaskStatus.FAILED
+    assert final.attempts == 0  # nothing ever executed
+    assert final.reclaim_count == 2  # bounded by max_reclaims_before_start
+    assert tm.store.list_attempts(task.task_id) == []  # no fake attempts
+
+
+def test_claim_then_no_start_single_reclaim_requeues():
+    """One ASSIGNED stale (no start) is requeued once, still no attempt."""
+    tm = _make_manager(heartbeat_timeout=1.0, max_reclaims_before_start=5)
+    tm.store.register_agent("agent-1", "h1")
+    (task,) = tm.submit("a" * 64, ["mock_engine_a"])
+    claimed = tm.claim("agent-1", ["mock_engine_a"])
+    assert claimed is not None
+    tm.requeue_stale(now=time.time() + 10)
+    final = tm.store.get_task(task.task_id)
+    assert final.status == TaskStatus.QUEUED
+    assert final.attempts == 0
+    assert final.reclaim_count == 1
 
 
 # ---- attempt history ---------------------------------------------------------

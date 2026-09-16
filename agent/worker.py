@@ -129,9 +129,14 @@ class Agent:
         """Report a result with exponential backoff so a transient network
         blip cannot strand a finished task in ``running``.
 
-        The coordinator's result endpoint is idempotent (INSERT OR REPLACE),
-        so retries are safe: at-least-once delivery with idempotent handling
-        gives us logically exactly-once results.
+        Retry policy: only transient failures are retried — network errors and
+        5xx (plus 429). A 4xx response (especially 409, meaning our lease was
+        revoked) is permanent: retrying is pointless because the coordinator
+        will keep rejecting it, so we stop immediately.
+
+        The coordinator's result endpoint is idempotent, so retries are safe:
+        at-least-once delivery with idempotent acceptance gives us a single
+        canonical result.
         """
         delay = REPORT_BACKOFF_BASE_S
         for attempt in range(1, REPORT_MAX_ATTEMPTS + 1):
@@ -147,6 +152,15 @@ class Agent:
                     },
                     timeout=10,
                 )
+                if resp.status_code >= 400 and resp.status_code < 500:
+                    # Permanent rejection (409 lease revoked, 4xx bad request):
+                    # retrying will not help. Stop immediately.
+                    logger.warning(
+                        "result report rejected with %d for %s; not retrying",
+                        resp.status_code,
+                        task.task_id,
+                    )
+                    return
                 resp.raise_for_status()
                 logger.info(
                     "task %s -> %s verdict=%s",

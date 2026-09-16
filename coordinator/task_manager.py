@@ -5,12 +5,26 @@ is validated by the TaskStateMachine before it is persisted; Storage only
 stores what TaskManager tells it to. This is what keeps the platform safe to
 run with many agents.
 
-Lease model: when an agent claims a task the task enters ASSIGNED with that
-agent_id. ``start`` confirms the lease (rejects if the agent is no longer the
-lease holder), then moves the task to RUNNING. A task whose agent stops
-heartbeating or whose lease time exceeds ``execution_timeout_s`` is reclaimed
-by the scheduler and requeued; each reclaim consumes one retry budget, so a
-crashed agent cannot loop forever.
+Attempt semantics
+-----------------
+``task.attempts`` counts *executions that actually started*: it increments only
+when a task moves ASSIGNED -> RUNNING (``start``). This is the retry budget.
+
+- RUNNING task goes stale (timeout / agent crash): the *current* attempt is
+  closed as failed, but ``attempts`` is NOT incremented again — the execution
+  was already counted when it started.
+- ASSIGNED task goes stale (agent died before ``start``): nothing was executed,
+  so no ScanAttempt is created and ``attempts`` is untouched.
+
+Repeated claim-before-start abuse is bounded separately by ``reclaim_count``,
+which is *not* the execution budget: it only guards against a broken node
+grabbing tasks it can never start. ``reclaim_count`` and ``attempts`` are never
+mixed.
+
+Lease model: claiming gives an agent an exclusive lease. ``start`` confirms the
+lease (rejects if the agent is no longer the holder). A stale task is reclaimed
+by the scheduler; stale workers' late results are rejected (lease fencing), so
+execution is at-least-once while *accepted* results are idempotent.
 """
 from __future__ import annotations
 
@@ -25,6 +39,7 @@ from storage.sqlite import SQLiteStore
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_TIMEOUT_S = 60.0
+MAX_RECLAIMS_BEFORE_START = 5  # guards claim-without-start abuse
 
 
 class TaskManager:
@@ -32,9 +47,11 @@ class TaskManager:
         self,
         store: SQLiteStore,
         heartbeat_timeout: float = HEARTBEAT_TIMEOUT_S,
+        max_reclaims_before_start: int = MAX_RECLAIMS_BEFORE_START,
     ) -> None:
         self.store = store
         self.heartbeat_timeout = heartbeat_timeout
+        self.max_reclaims_before_start = max_reclaims_before_start
         self.sm = TaskStateMachine()
 
     # ---- submission -------------------------------------------------------
@@ -79,6 +96,9 @@ class TaskManager:
         Returns None if the agent is not the current lease holder, or the task
         is not in ASSIGNED — the caller must then NOT execute the scan, to avoid
         two workers scanning the same artifact.
+
+        This is the ONLY place ``attempts`` is incremented: an attempt is a
+        scan execution that actually started.
         """
         task = self.store.get_task(task_id)
         if task is None or task.agent_id != agent_id:
@@ -88,7 +108,7 @@ class TaskManager:
         except InvalidTransition:
             logger.warning("task %s cannot start from %s", task_id, task.status)
             return None
-        task.attempts += 1  # each execution consumes retry budget
+        task.attempts += 1
         self._record_attempt(task, status=TaskStatus.RUNNING, error=None)
         self.store.update_task(task)
         return task
@@ -96,23 +116,24 @@ class TaskManager:
     def report(self, task_id: str, agent_id: str, result: ScanResult) -> ScanTask | None:
         """Finalize a task from a result: running -> succeeded | failed.
 
-        Idempotent-ish guard: only the agent that holds the task's lease may
-        report. If a stale agent reports after the task was reclaimed, the
-        report is rejected (returns None) and its duplicate execution is
-        discarded. On failure with retries remaining the task is requeued;
-        otherwise it stays FAILED. The result is always persisted.
+        Lease fencing: only the agent that holds the task's lease may report; a
+        stale agent's late result is rejected (returns None) and its duplicate
+        execution is discarded.
+
+        True idempotency: the first accepted terminal result becomes the
+        canonical result. A duplicate report on an already-terminal task is
+        ACKed WITHOUT overwriting the stored result.
         """
         task = self.store.get_task(task_id)
         if task is None or task.agent_id != agent_id:
             logger.warning("result rejected for %s from %s", task_id, agent_id)
             return None
 
-        # Idempotency: if the task is already terminal, the result was already
-        # recorded (duplicate delivery). Re-store and acknowledge without
-        # touching the state machine.
+        # Idempotency: terminal is final. ACK and return the existing task; do
+        # NOT re-store, so a conflicting duplicate can never overwrite the
+        # canonical result (first accepted terminal result wins).
         if task.status in (TaskStatus.SUCCEEDED, TaskStatus.FAILED):
-            logger.info("task %s already terminal; acking duplicate result", task_id)
-            self.store.save_result(result)
+            logger.info("task %s already terminal; acking duplicate result (canonical kept)", task_id)
             return task
 
         try:
@@ -155,14 +176,21 @@ class TaskManager:
     # ---- reclaim / timeout ---------------------------------------------------
 
     def requeue_stale(self, now: float | None = None) -> int:
-        """Requeue ASSIGNED/RUNNING tasks whose lease has expired.
+        """Reclaim tasks whose lease has expired.
 
         A task is stale when its agent stopped heartbeating, or it has been
-        RUNNING longer than ``execution_timeout_s`` (execution timeout). Each
-        reclaim consumes one retry budget (attempt), so a repeatedly-crashing
-        agent cannot reschedule the same task forever.
+        RUNNING longer than ``execution_timeout_s``.
 
-        Returns the number of tasks requeued.
+        - RUNNING stale: close the current attempt as failed, then requeue if
+          retries remain. ``attempts`` is NOT incremented (already counted at
+          start).
+        - ASSIGNED stale (agent died before start): nothing was executed, so no
+          ScanAttempt is created and ``attempts`` is untouched. ``reclaim_count``
+          is incremented to bound claim-without-start abuse.
+        - Budget exhausted -> terminal FAILED (valid from both RUNNING and
+          ASSIGNED via the state machine).
+
+        Returns the number of tasks requeued (not failed).
         """
         now = now or time.time()
         requeued = 0
@@ -174,25 +202,46 @@ class TaskManager:
                 continue
             agent = agents.get(task.agent_id)
             heartbeat_dead = agent is None or (now - float(agent["last_seen"])) > self.heartbeat_timeout
-            # For RUNNING tasks also apply the execution timeout (lease length).
             lease_dead = task.status == TaskStatus.RUNNING and (
                 now - task.updated_at
             ) > task.execution_timeout_s
             if not (heartbeat_dead or lease_dead):
                 continue
-            task.attempts += 1
-            logger.warning(
-                "task %s stale (agent %s, status %s); requeueing (attempt %d/%d)",
-                task.task_id,
-                task.agent_id,
-                task.status.value,
-                task.attempts,
-                task.max_retries,
-            )
-            self._record_attempt(task, status=TaskStatus.QUEUED, error="stale lease")
-            if task.attempts >= task.max_retries:
-                # Budget exhausted: mark failed instead of requeueing again.
+
+            if task.status == TaskStatus.RUNNING:
+                # Execution started; close the current attempt as failed.
+                self._close_attempt(task, error="stale lease (timeout)")
+                logger.warning(
+                    "task %s stale while running (agent %s); attempt %d/%d closed",
+                    task.task_id,
+                    task.agent_id,
+                    task.attempts,
+                    task.max_retries,
+                )
+            else:
+                # ASSIGNED but never started: no execution happened.
+                task.reclaim_count += 1
+                logger.warning(
+                    "task %s stale before start (agent %s); reclaim %d/%d",
+                    task.task_id,
+                    task.agent_id,
+                    task.reclaim_count,
+                    self.max_reclaims_before_start,
+                )
+                if task.reclaim_count >= self.max_reclaims_before_start:
+                    logger.error(
+                        "task %s failed: claimed but never started %d times",
+                        task.task_id,
+                        task.reclaim_count,
+                    )
+                    self._fail_permanently(task)
+                    continue
+
+            if task.attempts >= task.max_retries and task.status == TaskStatus.RUNNING:
+                # Execution budget exhausted after a failed attempt.
                 self._fail_permanently(task)
+                continue
+            if task.status in (TaskStatus.FAILED,):
                 continue
             self._requeue(task)
             requeued += 1
@@ -206,6 +255,7 @@ class TaskManager:
         self.store.requeue_task(task)
 
     def _fail_permanently(self, task: ScanTask) -> None:
+        """Mark a task terminal FAILED, valid from RUNNING or ASSIGNED."""
         self.sm.transition(task, TaskStatus.FAILED)
         task.agent_id = None
         self.store.update_task(task)
@@ -231,3 +281,11 @@ class TaskManager:
             verdict=verdict,
         )
         self.store.insert_attempt(attempt)
+
+    def _close_attempt(self, task: ScanTask, error: str) -> None:
+        """Close the in-flight attempt (the one recorded at start) as failed."""
+        self._record_attempt(
+            task,
+            status=TaskStatus.FAILED,
+            error=error,
+        )

@@ -43,10 +43,10 @@ Agents × N  ──►  Executor  ──►  ScannerAdapter (mock_engine_a / b /
   to nodes that actually have the engine.
 - **Agent** — pull-based worker: registers with its capabilities, heartbeats,
   claims tasks, runs them through an adapter, reports normalized results.
-  A **lease** model guarantees one worker executes a task: a `409` on start
-  means the lease expired and the agent must not run. Join any number of
-  heterogeneous agents to a running coordinator with zero coordinator-side
-  config.
+  **Lease-based ownership** prevents stale workers from committing results: a
+  `409` on start means the lease expired and the agent must not run. Join any
+  number of heterogeneous agents to a running coordinator with zero
+  coordinator-side config.
 - **Adapter** — one interface (`scan(task) -> ScanResult`); the mock engines
   demonstrate the contract and the retry path. Real engines plug in the same
   way.
@@ -56,6 +56,12 @@ endpoint is **idempotent**, so a network blip can't strand a finished task in
 `running`. Every execution is recorded as a **ScanAttempt** (task vs attempt
 separation), keeping full retry history; a reclaim by the scheduler consumes
 one retry budget, so a crashing agent can't loop forever.
+
+**Execution semantics**: execution itself is **at-least-once** — a network
+partition can leave two agents both running a reclaimed task. What the platform
+guarantees is a single *accepted* outcome: **lease fencing** (stale agents'
+starts/reports are rejected) plus **idempotent result acceptance** (the first
+accepted terminal result is canonical and later duplicates never overwrite it).
 
 See [docs/architecture.md](docs/architecture.md) for the full design (lifecycle
 diagram, lease/execution-timeout model, failure-handling table, trade-offs).
@@ -90,9 +96,10 @@ queued → assigned → running → succeeded | failed → (retry) → queued
 - agent dies → heartbeat goes silent → scheduler reclaims its tasks;
 - agent hangs → task `RUNNING` past `execution_timeout_s` → lease expires →
   scheduler reclaims;
-- result lost → agent retries with backoff; idempotent endpoint dedupes;
-- stale worker double-executes → lease revoked, `start` returns `409`, late
-  report rejected;
+- result lost → agent retries with backoff (network/5xx only; 4xx stops);
+  idempotent acceptance keeps the first terminal result canonical;
+- stale worker's late result → lease revoked, rejected — cannot overwrite the
+  accepted result (at-least-once execution, single accepted outcome);
 - coordinator restarts → tasks persist in SQLite, state machine resumes;
 - claim race → `BEGIN IMMEDIATE` transaction guarantees one agent per task.
 
@@ -159,6 +166,7 @@ see capability-aware scheduling in action.
 ### Tests
 
 ```bash
+pip install -r requirements-dev.txt
 python -m pytest
 ```
 
@@ -191,18 +199,21 @@ Normalized result for `mock_engine_a`:
 ## Test results
 
 ```
-39 passed
+43 passed
 ```
 
 CI runs on Python 3.10 / 3.11 / 3.12 with ruff linting. Coverage includes:
 
-- state machine transitions (valid + invalid)
+- state machine transitions (valid + invalid, incl. ASSIGNED → FAILED)
 - task manager submit/claim/report/retry/heartbeat-reclaim
 - **20-thread concurrent claim — exactly one agent wins**
 - **capability-aware scheduling — engine-B-only agent never gets engine-A task**
 - **lease expiry — reclaimed task rejects stale agent's start and late report**
-- **idempotent result reporting — duplicate reports don't corrupt state**
+- **idempotent result reporting — conflicting duplicate (BENIGN then MALICIOUS)
+  cannot overwrite the canonical result**
 - **execution timeout — hung task reclaimed, retry budget consumed**
+- **attempt counting — reclaims never double-count; ASSIGNED-stale creates no
+  fake attempt and is bounded by reclaim_count**
 - **attempt history — every execution recorded with verdict & error**
 - end-to-end API flow (submit → claim → start → report → result)
 
