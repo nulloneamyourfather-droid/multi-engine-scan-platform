@@ -1,8 +1,9 @@
 # Multi-Engine Scan Platform
 
-> A vendor-neutral distributed scanning platform with **Coordinator**, **Agent**,
-> pluggable **Scanner Adapters**, task queue, **retry**, **state machine** and
-> **normalized results**.
+> A vendor-neutral distributed scanning platform designed for **batch file
+> analysis across heterogeneous scanning engines** — with **Coordinator**,
+> **Agent**, pluggable **Scanner Adapters**, task queue, **retry**, **state
+> machine** and **normalized results**.
 
 ```
 Distributed Task Scheduling · Agent Architecture · Pluggable Adapter ·
